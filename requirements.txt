@@ -1,0 +1,27 @@
+# TA Interview Scheduler - Databricks App Dependencies
+
+# Dash framework and components
+dash==3.0.4
+dash-iconify==0.1.2
+dash-mantine-components==2.0.0
+
+# Flask for request handling
+flask==3.0.3
+
+# Google Calendar API (optional - for real calendar integration)
+google-api-python-client==2.149.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+
+# Databricks SDK
+databricks-sdk==0.56.0
+
+# Data handling
+pandas==2.2.3
+
+# Date/time utilities
+python-dateutil==2.9.0.post0
+pytz==2025.2
+
+# Environment management
+python-dotenv==1.0.1
