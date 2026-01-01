@@ -1,8 +1,9 @@
 """
-Google Calendar Service - Supports two authentication modes:
+Google Calendar Service - Supports multiple authentication modes:
 
 1. PERSONAL_OAUTH: For testing with personal Gmail (accesses your own calendar)
 2. DOMAIN_DELEGATION: For organization-wide access with service account + domain-wide delegation
+3. DATABRICKS_SECRETS: For Databricks deployment - loads pre-generated token from secrets
 
 The service manages an allowlist of calendars (SA emails) that can be queried.
 """
@@ -10,6 +11,7 @@ The service manages an allowlist of calendars (SA emails) that can be queried.
 import os
 import json
 import pickle
+import base64
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -22,6 +24,39 @@ from google.oauth2 import service_account
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+
+
+def _load_token_from_databricks_secrets() -> Optional[bytes]:
+    """
+    Load OAuth token from Databricks secrets.
+    
+    Expected environment variables:
+    - DATABRICKS_OAUTH_TOKEN_B64: Base64-encoded token.pickle content
+    
+    Or using Databricks SDK:
+    - Reads from secret scope 'ta-scheduler' key 'oauth-token'
+    """
+    # Method 1: Direct environment variable (base64 encoded)
+    token_b64 = os.environ.get('DATABRICKS_OAUTH_TOKEN_B64')
+    if token_b64:
+        try:
+            return base64.b64decode(token_b64)
+        except Exception as e:
+            print(f"Error decoding token from env: {e}")
+    
+    # Method 2: Databricks SDK (when running in Databricks)
+    try:
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient()
+        secret = w.secrets.get_secret(scope='ta-scheduler', key='oauth-token')
+        if secret and secret.value:
+            return base64.b64decode(secret.value)
+    except ImportError:
+        pass  # Not running in Databricks
+    except Exception as e:
+        print(f"Could not load from Databricks secrets: {e}")
+    
+    return None
 
 
 class CalendarService:
@@ -63,20 +98,29 @@ class CalendarService:
     def _authenticate(self) -> None:
         """
         Authenticate with Google Calendar API.
-        Tries service account first (for org-wide), falls back to OAuth (for personal).
+        Priority order:
+        1. Service account (for org-wide with domain delegation)
+        2. Databricks secrets (for cloud deployment)
+        3. Local OAuth token (for local testing)
         """
         # Try service account first (preferred for production)
         if Path(self.SERVICE_ACCOUNT_FILE).exists():
             if self._authenticate_service_account():
                 return
         
-        # Fall back to OAuth (for personal testing)
-        if Path(self.OAUTH_CREDENTIALS_FILE).exists():
+        # Check for Databricks secrets token
+        if _load_token_from_databricks_secrets():
+            if self._authenticate_oauth():  # This will pick up the secret token
+                return
+        
+        # Fall back to OAuth (for personal testing with local files)
+        if Path(self.OAUTH_CREDENTIALS_FILE).exists() or Path(self.TOKEN_FILE).exists():
             if self._authenticate_oauth():
                 return
         
         print("⚠️  No credentials found. Running in demo mode.")
-        print(f"   For OAuth: save credentials as '{self.OAUTH_CREDENTIALS_FILE}'")
+        print(f"   For local: save credentials as '{self.OAUTH_CREDENTIALS_FILE}'")
+        print(f"   For Databricks: Set DATABRICKS_OAUTH_TOKEN_B64 environment variable")
         print(f"   For Service Account: save key as '{self.SERVICE_ACCOUNT_FILE}'")
     
     def _authenticate_service_account(self) -> bool:
@@ -103,8 +147,18 @@ class CalendarService:
         creds = None
         token_path = Path(self.TOKEN_FILE)
         
-        # Load existing token
-        if token_path.exists():
+        # Try loading from Databricks secrets first (for cloud deployment)
+        secret_token = _load_token_from_databricks_secrets()
+        if secret_token:
+            try:
+                creds = pickle.loads(secret_token)
+                print("✅ Loaded token from Databricks secrets")
+            except Exception as e:
+                print(f"Error loading token from secrets: {e}")
+                creds = None
+        
+        # Fall back to file-based token
+        if not creds and token_path.exists():
             try:
                 with open(token_path, 'rb') as token:
                     creds = pickle.load(token)
@@ -116,10 +170,21 @@ class CalendarService:
             if creds and creds.expired and creds.refresh_token:
                 try:
                     creds.refresh(Request())
+                    # Save refreshed token back to file (for local dev)
+                    try:
+                        with open(token_path, 'wb') as token:
+                            pickle.dump(creds, token)
+                    except:
+                        pass
                 except Exception:
                     creds = None
             
             if not creds:
+                # Only run OAuth flow if credentials.json exists (local dev only)
+                if not Path(self.OAUTH_CREDENTIALS_FILE).exists():
+                    print("❌ No token available and cannot run OAuth flow (no credentials.json)")
+                    print("   For Databricks: Set DATABRICKS_OAUTH_TOKEN_B64 or use secrets")
+                    return False
                 try:
                     flow = InstalledAppFlow.from_client_secrets_file(
                         self.OAUTH_CREDENTIALS_FILE, self.SCOPES

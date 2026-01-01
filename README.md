@@ -223,21 +223,65 @@ Open http://localhost:8000
 
 ### Deploy to Databricks
 
-1. Push code to a Databricks Git folder:
-   ```bash
-   git add .
-   git commit -m "Update scheduler"
-   git push origin main
-   ```
+#### Step 1: Generate OAuth Token Locally
 
-2. In Databricks workspace:
-   - **Compute** → **Apps** → Select your app
-   - Click **"Sync"** to pull latest changes
-   - Or create new: **Create App** → **Custom** → Deploy from git
+```bash
+# Run app locally to generate token.pickle
+cd ta_interview_scheduler
+python app.py   # Complete OAuth flow in browser
+```
 
-3. Configure secrets (if using Calendar API):
-   - Store `credentials.json` content as a Databricks secret
-   - Reference in app environment variables
+#### Step 2: Export Token for Databricks
+
+```bash
+# Run the export script
+python scripts/export_token_for_databricks.py
+```
+
+This outputs a base64-encoded token string.
+
+#### Step 3: Store Token in Databricks
+
+**Option A: Environment Variable (simpler)**
+
+In Databricks App settings, add:
+```yaml
+env:
+  - name: DATABRICKS_OAUTH_TOKEN_B64
+    value: <paste the base64 string here>
+```
+
+**Option B: Databricks Secrets (more secure)**
+
+```bash
+# Create secret scope (one-time)
+databricks secrets create-scope ta-scheduler
+
+# Store the token
+echo "<base64_token>" | databricks secrets put-secret ta-scheduler oauth-token
+```
+
+#### Step 4: Push and Deploy
+
+```bash
+git add .
+git commit -m "Update scheduler"
+git push origin main
+```
+
+In Databricks workspace:
+- **Compute** → **Apps** → Select your app
+- Click **"Sync"** to pull latest changes
+- Or create new: **Create App** → **Custom** → Deploy from git
+
+#### Authentication Priority in Databricks
+
+The app checks credentials in this order:
+1. `service_account.json` → Domain-wide delegation
+2. `DATABRICKS_OAUTH_TOKEN_B64` env var → Pre-generated OAuth token
+3. Databricks Secrets (`ta-scheduler/oauth-token`) → Secure token storage
+4. `token.pickle` file → Local file (not recommended for cloud)
+5. Neither → Demo mode with simulated data
 
 ---
 
