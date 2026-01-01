@@ -61,7 +61,41 @@ class InterviewTracker:
             print(f"Error saving interview data: {e}")
     
     def _get_default_sa_registry(self) -> Dict[str, Dict]:
-        """Get default SA registry. In production, this would come from HR system."""
+        """
+        Get SA registry from config file or use demo defaults.
+        
+        Config file: sa_config.json
+        This allows easy configuration of the SA allowlist.
+        """
+        config_file = Path("sa_config.json")
+        
+        # Try to load from config file
+        if config_file.exists():
+            try:
+                with open(config_file, 'r') as f:
+                    config = json.load(f)
+                    sa_list = config.get('solution_architects', [])
+                    if sa_list:
+                        registry = {}
+                        for sa in sa_list:
+                            sa_id = sa.get('id', f"sa{len(registry)+1}")
+                            registry[sa_id] = {
+                                "id": sa_id,
+                                "name": sa.get('name', 'Unknown'),
+                                "email": sa.get('email', ''),
+                                "calendar_id": sa.get('calendar_id', sa.get('email', '')),
+                                "specialty": sa.get('specialty', 'General'),
+                                "timezone": sa.get('timezone', 'America/Los_Angeles'),
+                                "active": sa.get('active', True),
+                                "max_interviews_per_week": sa.get('max_interviews_per_week', 5)
+                            }
+                        print(f"✅ Loaded {len(registry)} SAs from sa_config.json")
+                        return registry
+            except Exception as e:
+                print(f"⚠️  Error loading sa_config.json: {e}")
+        
+        # Demo defaults (used when no config file)
+        print("ℹ️  Using demo SA registry (configure sa_config.json for real calendars)")
         return {
             "sa1": {
                 "id": "sa1",
@@ -252,15 +286,19 @@ class InterviewTracker:
         Get detailed workload statistics per SA.
         
         Returns:
-            Dict with SA stats including count, percentage, and recommendation score
+            Dict with SA stats including count, capacity, and recommendation score
         """
         counts = self.get_interview_counts(since_days=since_days)
         total = sum(counts.values())
+        
+        # Also get this week's count for capacity check
+        weekly_counts = self.get_interview_counts(since_days=7)
         
         stats = {}
         for sa in self.get_all_sas():
             sa_id = sa['id']
             count = counts.get(sa_id, 0)
+            weekly_count = weekly_counts.get(sa_id, 0)
             
             # Calculate fair share (what they should have done)
             num_active_sas = len(self.get_all_sas())
@@ -269,21 +307,30 @@ class InterviewTracker:
             # Deviation from fair share (negative = under-utilized)
             deviation = count - fair_share
             
-            # Priority score: lower count = higher priority for next assignment
-            # Also factor in max interviews per week limit
+            # Capacity check - based on THIS WEEK's interviews
             max_per_week = sa.get('max_interviews_per_week', 5)
-            weekly_count = counts.get(sa_id, 0) * (7 / since_days) if since_days > 0 else 0
             capacity_used = weekly_count / max_per_week if max_per_week > 0 else 1
+            at_capacity = weekly_count >= max_per_week
+            
+            # Priority score: lower count = higher priority for next assignment
+            # If at capacity, set score to -999 to deprioritize
+            if at_capacity:
+                priority_score = -999
+            else:
+                priority_score = -deviation + (1 - capacity_used) * 2
             
             stats[sa_id] = {
                 "sa_id": sa_id,
                 "sa_name": sa['name'],
-                "specialty": sa['specialty'],
-                "interview_count": count,
+                "specialty": sa.get('specialty', 'General'),
+                "interview_count": count,  # Last 3 weeks
+                "weekly_count": weekly_count,  # This week
+                "max_per_week": max_per_week,
                 "fair_share": round(fair_share, 1),
                 "deviation": round(deviation, 1),
                 "capacity_used_pct": round(capacity_used * 100, 1),
-                "priority_score": round(-deviation + (1 - capacity_used) * 2, 2)  # Higher = more priority
+                "at_capacity": at_capacity,
+                "priority_score": round(priority_score, 2)
             }
         
         return stats
@@ -292,19 +339,21 @@ class InterviewTracker:
         self,
         available_sa_ids: List[str],
         interview_type: Optional[str] = None,
-        since_days: int = 21
+        since_days: int = 21,
+        exclude_at_capacity: bool = True
     ) -> List[Dict]:
         """
         Rank available SAs by priority for the next assignment.
         Considers:
-        1. Interview count in the period (fewer = higher priority)
-        2. Specialty match if interview_type provided
-        3. Capacity limits
+        1. Capacity limits (SAs at max are excluded)
+        2. Interview count in the period (fewer = higher priority)
+        3. Specialty match if interview_type provided
         
         Args:
             available_sa_ids: List of SA IDs who are available for the time slot
             interview_type: Optional interview type for specialty matching
             since_days: Look back period for fairness calculation
+            exclude_at_capacity: If True, exclude SAs who are at weekly max
             
         Returns:
             Sorted list of SA dicts with ranking info, best candidate first
@@ -324,12 +373,21 @@ class InterviewTracker:
         preferred_specialties = type_specialty_map.get(interview_type, [])
         
         ranked = []
+        at_capacity_count = 0
+        
         for sa_id in available_sa_ids:
             if sa_id not in stats:
                 continue
             
             sa_stats = stats[sa_id]
             sa_info = self.get_sa(sa_id)
+            
+            # Check capacity limit
+            if sa_stats.get('at_capacity', False):
+                at_capacity_count += 1
+                if exclude_at_capacity:
+                    print(f"  ⚠️ {sa_stats['sa_name']} at capacity ({sa_stats['weekly_count']}/{sa_stats['max_per_week']} this week)")
+                    continue
             
             # Base priority score
             score = sa_stats['priority_score']
@@ -347,6 +405,14 @@ class InterviewTracker:
         
         # Sort by final score (highest first)
         ranked.sort(key=lambda x: x['final_score'], reverse=True)
+        
+        # Add metadata about capacity situation
+        if ranked:
+            ranked[0]['_all_at_capacity'] = False
+        elif at_capacity_count > 0:
+            # Return a special marker indicating all SAs are at capacity
+            return [{"_all_at_capacity": True, "at_capacity_count": at_capacity_count}]
+        
         return ranked
     
     def get_best_sa_for_slot(

@@ -1,6 +1,10 @@
 """
-Google Calendar Service - Singleton pattern for calendar operations.
-Handles OAuth flow and calendar availability queries.
+Google Calendar Service - Supports two authentication modes:
+
+1. PERSONAL_OAUTH: For testing with personal Gmail (accesses your own calendar)
+2. DOMAIN_DELEGATION: For organization-wide access with service account + domain-wide delegation
+
+The service manages an allowlist of calendars (SA emails) that can be queried.
 """
 
 import os
@@ -8,25 +12,44 @@ import json
 import pickle
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from dateutil import parser as date_parser
 import pytz
 
+# Google API imports
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 
 class CalendarService:
-    """Singleton service for Google Calendar operations."""
+    """
+    Singleton service for Google Calendar operations.
+    
+    Supports two modes:
+    - Personal OAuth: For testing with your own Gmail
+    - Domain-Wide Delegation: For org-wide access to multiple calendars
+    """
     
     _instance = None
     _service = None
     _credentials = None
+    _mode = None  # 'oauth' or 'service_account'
     
-    # Required OAuth scopes
-    SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+    # OAuth scopes:
+    # - calendar.readonly: Check SA availability
+    # - calendar.events: Create events on organizer's calendar and send invites
+    SCOPES = [
+        'https://www.googleapis.com/auth/calendar.readonly',
+        'https://www.googleapis.com/auth/calendar.events'
+    ]
+    
+    # File paths
+    OAUTH_CREDENTIALS_FILE = 'credentials.json'
+    SERVICE_ACCOUNT_FILE = 'service_account.json'
+    TOKEN_FILE = 'token.pickle'
     
     def __new__(cls):
         if cls._instance is None:
@@ -37,73 +60,101 @@ class CalendarService:
         if self._service is None:
             self._authenticate()
     
-    def _get_credentials_path(self) -> Path:
-        """Get path to credentials file from environment or default location."""
-        creds_path = os.environ.get('GOOGLE_CREDENTIALS_JSON', 'credentials.json')
-        return Path(creds_path)
-    
-    def _get_token_path(self) -> Path:
-        """Get path to token pickle file."""
-        return Path('token.pickle')
-    
     def _authenticate(self) -> None:
-        """Authenticate with Google Calendar API using OAuth."""
-        token_path = self._get_token_path()
-        creds_path = self._get_credentials_path()
+        """
+        Authenticate with Google Calendar API.
+        Tries service account first (for org-wide), falls back to OAuth (for personal).
+        """
+        # Try service account first (preferred for production)
+        if Path(self.SERVICE_ACCOUNT_FILE).exists():
+            if self._authenticate_service_account():
+                return
         
+        # Fall back to OAuth (for personal testing)
+        if Path(self.OAUTH_CREDENTIALS_FILE).exists():
+            if self._authenticate_oauth():
+                return
+        
+        print("⚠️  No credentials found. Running in demo mode.")
+        print(f"   For OAuth: save credentials as '{self.OAUTH_CREDENTIALS_FILE}'")
+        print(f"   For Service Account: save key as '{self.SERVICE_ACCOUNT_FILE}'")
+    
+    def _authenticate_service_account(self) -> bool:
+        """Authenticate using service account with domain-wide delegation."""
+        try:
+            credentials = service_account.Credentials.from_service_account_file(
+                self.SERVICE_ACCOUNT_FILE,
+                scopes=self.SCOPES
+            )
+            
+            self._credentials = credentials
+            self._service = build('calendar', 'v3', credentials=credentials)
+            self._mode = 'service_account'
+            
+            print(f"✅ Authenticated with service account: {credentials.service_account_email}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Service account auth failed: {e}")
+            return False
+    
+    def _authenticate_oauth(self) -> bool:
+        """Authenticate using OAuth (for personal Gmail)."""
         creds = None
+        token_path = Path(self.TOKEN_FILE)
         
-        # Load existing token if available
+        # Load existing token
         if token_path.exists():
             try:
                 with open(token_path, 'rb') as token:
                     creds = pickle.load(token)
             except Exception as e:
                 print(f"Error loading token: {e}")
-                creds = None
         
-        # Refresh or obtain new credentials
+        # Refresh or get new credentials
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 try:
                     creds.refresh(Request())
-                except Exception as e:
-                    print(f"Error refreshing token: {e}")
+                except Exception:
                     creds = None
             
             if not creds:
-                if not creds_path.exists():
-                    print(f"Credentials file not found at {creds_path}")
-                    print("Please download OAuth credentials from Google Cloud Console")
-                    return
-                
                 try:
                     flow = InstalledAppFlow.from_client_secrets_file(
-                        str(creds_path), self.SCOPES
+                        self.OAUTH_CREDENTIALS_FILE, self.SCOPES
                     )
                     creds = flow.run_local_server(port=0)
                 except Exception as e:
-                    print(f"Error during OAuth flow: {e}")
-                    return
+                    print(f"❌ OAuth flow failed: {e}")
+                    return False
             
-            # Save token for future use
+            # Save token
             try:
                 with open(token_path, 'wb') as token:
                     pickle.dump(creds, token)
             except Exception as e:
-                print(f"Error saving token: {e}")
+                print(f"Warning: Could not save token: {e}")
         
-        self._credentials = creds
-        
-        if creds:
-            try:
-                self._service = build('calendar', 'v3', credentials=creds)
-            except Exception as e:
-                print(f"Error building calendar service: {e}")
+        try:
+            self._credentials = creds
+            self._service = build('calendar', 'v3', credentials=creds)
+            self._mode = 'oauth'
+            print("✅ Authenticated with OAuth (personal Gmail)")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to build calendar service: {e}")
+            return False
     
     def is_authenticated(self) -> bool:
         """Check if the service is authenticated."""
         return self._service is not None
+    
+    def get_mode(self) -> Optional[str]:
+        """Get the current authentication mode."""
+        return self._mode
+    
+    # ==================== Calendar Operations ====================
     
     def get_calendars(self) -> List[Dict]:
         """Get list of accessible calendars."""
@@ -124,123 +175,110 @@ class CalendarService:
             print(f"Error fetching calendars: {e}")
             return []
     
-    def get_events(
-        self,
-        calendar_id: str = 'primary',
-        start_date: datetime = None,
-        end_date: datetime = None,
-        max_results: int = 100
-    ) -> List[Dict]:
+    def get_service_for_user(self, user_email: str):
         """
-        Get events from a calendar within a date range.
+        Get a calendar service impersonating a specific user.
+        Only works with service account + domain-wide delegation.
         
         Args:
-            calendar_id: Calendar ID (default: 'primary')
-            start_date: Start of date range (default: now)
-            end_date: End of date range (default: 7 days from now)
-            max_results: Maximum number of events to return
+            user_email: Email of the user to impersonate
             
         Returns:
-            List of event dictionaries
+            Calendar service for that user, or None if not possible
         """
-        if not self._service:
-            return []
-        
-        if start_date is None:
-            start_date = datetime.now(pytz.UTC)
-        if end_date is None:
-            end_date = start_date + timedelta(days=7)
-        
-        # Ensure timezone awareness
-        if start_date.tzinfo is None:
-            start_date = pytz.UTC.localize(start_date)
-        if end_date.tzinfo is None:
-            end_date = pytz.UTC.localize(end_date)
+        if self._mode != 'service_account':
+            print(f"⚠️  Cannot impersonate users in OAuth mode. Using default service.")
+            return self._service
         
         try:
-            events_result = self._service.events().list(
-                calendarId=calendar_id,
-                timeMin=start_date.isoformat(),
-                timeMax=end_date.isoformat(),
-                maxResults=max_results,
-                singleEvents=True,
-                orderBy='startTime'
-            ).execute()
-            
-            events = []
-            for event in events_result.get('items', []):
-                start = event['start'].get('dateTime', event['start'].get('date'))
-                end = event['end'].get('dateTime', event['end'].get('date'))
-                
-                events.append({
-                    'id': event['id'],
-                    'summary': event.get('summary', 'Busy'),
-                    'start': start,
-                    'end': end,
-                    'all_day': 'date' in event['start'],
-                    'status': event.get('status', 'confirmed')
-                })
-            
-            return events
-            
+            # Create delegated credentials
+            delegated_creds = self._credentials.with_subject(user_email)
+            return build('calendar', 'v3', credentials=delegated_creds)
         except Exception as e:
-            print(f"Error fetching events: {e}")
-            return []
+            print(f"❌ Failed to impersonate {user_email}: {e}")
+            return None
     
     def get_free_busy(
         self,
-        calendar_ids: List[str],
-        start_date: datetime,
-        end_date: datetime
+        calendar_emails: List[str],
+        start_time: datetime,
+        end_time: datetime
     ) -> Dict[str, List[Dict]]:
         """
         Get free/busy information for multiple calendars.
         
+        In OAuth mode: Only works for calendars shared with you
+        In Service Account mode: Works for any user (with domain-wide delegation)
+        
         Args:
-            calendar_ids: List of calendar IDs to check
-            start_date: Start of date range
-            end_date: End of date range
+            calendar_emails: List of email addresses to check
+            start_time: Start of time range
+            end_time: End of time range
             
         Returns:
-            Dictionary mapping calendar IDs to busy periods
+            Dict mapping email to list of busy periods
         """
         if not self._service:
             return {}
         
         # Ensure timezone awareness
-        if start_date.tzinfo is None:
-            start_date = pytz.UTC.localize(start_date)
-        if end_date.tzinfo is None:
-            end_date = pytz.UTC.localize(end_date)
+        if start_time.tzinfo is None:
+            start_time = pytz.UTC.localize(start_time)
+        if end_time.tzinfo is None:
+            end_time = pytz.UTC.localize(end_time)
         
-        try:
-            body = {
-                "timeMin": start_date.isoformat(),
-                "timeMax": end_date.isoformat(),
-                "items": [{"id": cal_id} for cal_id in calendar_ids]
-            }
-            
-            result = self._service.freebusy().query(body=body).execute()
-            
-            busy_times = {}
-            for cal_id, cal_info in result.get('calendars', {}).items():
-                busy_times[cal_id] = [
-                    {
-                        'start': period['start'],
-                        'end': period['end']
-                    }
-                    for period in cal_info.get('busy', [])
-                ]
-            
-            return busy_times
-            
-        except Exception as e:
-            print(f"Error fetching free/busy: {e}")
-            return {}
+        results = {}
+        
+        if self._mode == 'service_account':
+            # With domain-wide delegation, we can query each user's calendar by impersonating them
+            for email in calendar_emails:
+                try:
+                    user_service = self.get_service_for_user(email)
+                    if user_service:
+                        body = {
+                            "timeMin": start_time.isoformat(),
+                            "timeMax": end_time.isoformat(),
+                            "items": [{"id": email}]
+                        }
+                        response = user_service.freebusy().query(body=body).execute()
+                        cal_info = response.get('calendars', {}).get(email, {})
+                        
+                        if 'errors' in cal_info:
+                            print(f"⚠️  Error for {email}: {cal_info['errors']}")
+                            results[email] = []
+                        else:
+                            results[email] = cal_info.get('busy', [])
+                except Exception as e:
+                    print(f"❌ Error querying {email}: {e}")
+                    results[email] = []
+        else:
+            # OAuth mode - query all at once (only works for shared calendars)
+            try:
+                body = {
+                    "timeMin": start_time.isoformat(),
+                    "timeMax": end_time.isoformat(),
+                    "items": [{"id": email} for email in calendar_emails]
+                }
+                response = self._service.freebusy().query(body=body).execute()
+                
+                for email in calendar_emails:
+                    cal_info = response.get('calendars', {}).get(email, {})
+                    if 'errors' in cal_info:
+                        print(f"⚠️  Cannot access {email}: {cal_info['errors']}")
+                        results[email] = []
+                    else:
+                        results[email] = cal_info.get('busy', [])
+                        
+            except Exception as e:
+                print(f"❌ Error querying free/busy: {e}")
+                for email in calendar_emails:
+                    results[email] = []
+        
+        return results
     
     def find_available_slots(
         self,
-        calendar_ids: List[str],
+        calendar_emails: List[str],
         start_date: datetime,
         end_date: datetime,
         slot_duration_minutes: int = 60,
@@ -252,36 +290,38 @@ class CalendarService:
         Find available time slots across multiple calendars.
         
         Args:
-            calendar_ids: List of calendar IDs to check
+            calendar_emails: List of email addresses to check
             start_date: Start of date range
             end_date: End of date range
-            slot_duration_minutes: Duration of each slot in minutes
+            slot_duration_minutes: Duration of each slot
             work_start_hour: Start of working hours (default 9 AM)
             work_end_hour: End of working hours (default 5 PM)
             timezone: Timezone for working hours
             
         Returns:
-            List of available slot dictionaries with calendar availability
+            List of available slots with per-calendar availability
         """
         tz = pytz.timezone(timezone)
         
-        # Get free/busy for all calendars
-        busy_times = self.get_free_busy(calendar_ids, start_date, end_date)
+        # Get busy times for all calendars
+        busy_times = self.get_free_busy(calendar_emails, start_date, end_date)
         
-        # Parse busy times into datetime objects
+        # Parse busy times into datetime ranges
         parsed_busy = {}
-        for cal_id, periods in busy_times.items():
-            parsed_busy[cal_id] = [
-                (
-                    date_parser.parse(p['start']),
-                    date_parser.parse(p['end'])
-                )
-                for p in periods
-            ]
+        for email, periods in busy_times.items():
+            parsed_busy[email] = []
+            for period in periods:
+                try:
+                    start = date_parser.parse(period['start'])
+                    end = date_parser.parse(period['end'])
+                    parsed_busy[email].append((start, end))
+                except Exception as e:
+                    print(f"Error parsing busy period: {e}")
         
+        # Generate slots
         available_slots = []
-        current_date = start_date.date()
-        end_date_only = end_date.date()
+        current_date = start_date.date() if hasattr(start_date, 'date') else start_date
+        end_date_only = end_date.date() if hasattr(end_date, 'date') else end_date
         
         while current_date <= end_date_only:
             # Skip weekends
@@ -302,22 +342,22 @@ class CalendarService:
                 
                 # Check availability for each calendar
                 availability = {}
-                for cal_id in calendar_ids:
+                for email in calendar_emails:
                     is_available = True
-                    for busy_start, busy_end in parsed_busy.get(cal_id, []):
+                    for busy_start, busy_end in parsed_busy.get(email, []):
                         # Check for overlap
                         if not (slot_end <= busy_start or slot_start >= busy_end):
                             is_available = False
                             break
-                    availability[cal_id] = is_available
+                    availability[email] = is_available
                 
-                # Only include slots where at least one person is available
+                # Include slot if at least one person is available
                 if any(availability.values()):
                     available_slots.append({
                         'start': slot_start.isoformat(),
                         'end': slot_end.isoformat(),
                         'date': current_date.strftime('%Y-%m-%d'),
-                        'time': slot_start.strftime('%H:%M'),
+                        'time': slot_start.strftime('%I:%M %p'),
                         'availability': availability
                     })
                 
@@ -326,11 +366,136 @@ class CalendarService:
             current_date += timedelta(days=1)
         
         return available_slots
+    
+    def send_interview_invite(
+        self,
+        title: str,
+        start_time: str,
+        end_time: str,
+        description: str = "",
+        attendees: List[str] = None,
+        organizer_email: str = None
+    ) -> Optional[Dict]:
+        """
+        Send interview calendar invites via email with RSVP.
+        
+        Creates an event on the ORGANIZER's calendar and sends invites to all
+        attendees (SA and candidate). They can Accept/Decline/Maybe.
+        
+        This does NOT require write access to attendees' calendars - only the
+        organizer's calendar. Attendees receive email invites and the event
+        appears on their calendar when they accept.
+        
+        Args:
+            title: Event title (e.g., "Technical Interview - John Doe")
+            start_time: ISO format start time
+            end_time: ISO format end time
+            description: Event description with details
+            attendees: List of attendee email addresses (SA + candidate)
+            organizer_email: Email of the organizer (optional, uses primary)
+            
+        Returns:
+            Created event data with invite status, or None if failed
+        """
+        if not self._service:
+            print("❌ Calendar service not authenticated")
+            return None
+        
+        # Build event body
+        event = {
+            'summary': title,
+            'description': description,
+            'start': {
+                'dateTime': start_time,
+                'timeZone': 'UTC',
+            },
+            'end': {
+                'dateTime': end_time,
+                'timeZone': 'UTC',
+            },
+            'guestsCanModify': False,
+            'guestsCanInviteOthers': False,
+            'guestsCanSeeOtherGuests': True,
+        }
+        
+        # Add attendees - they will receive email invites with RSVP
+        if attendees:
+            event['attendees'] = [
+                {'email': email, 'responseStatus': 'needsAction'} 
+                for email in attendees
+            ]
+        
+        # Add Google Meet video conference
+        event['conferenceData'] = {
+            'createRequest': {
+                'requestId': f"interview-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                'conferenceSolutionKey': {'type': 'hangoutsMeet'}
+            }
+        }
+        
+        try:
+            # Create on organizer's primary calendar
+            # This sends email invites to all attendees automatically
+            created_event = self._service.events().insert(
+                calendarId='primary',  # Organizer's calendar
+                body=event,
+                sendUpdates='all',  # Send email invites to all attendees
+                conferenceDataVersion=1  # Required for Google Meet
+            ).execute()
+            
+            meet_link = ''
+            if 'conferenceData' in created_event:
+                entry_points = created_event['conferenceData'].get('entryPoints', [])
+                for ep in entry_points:
+                    if ep.get('entryPointType') == 'video':
+                        meet_link = ep.get('uri', '')
+                        break
+            
+            print(f"✅ Interview invite sent!")
+            print(f"   Event: {created_event.get('htmlLink')}")
+            if meet_link:
+                print(f"   Meet: {meet_link}")
+            print(f"   📧 Invites sent to: {', '.join(attendees or [])}")
+            
+            return {
+                'id': created_event.get('id'),
+                'link': created_event.get('htmlLink'),
+                'meet_link': meet_link,
+                'start': created_event['start'].get('dateTime'),
+                'end': created_event['end'].get('dateTime'),
+                'attendees': [
+                    {
+                        'email': a.get('email'),
+                        'status': a.get('responseStatus', 'needsAction')
+                    }
+                    for a in created_event.get('attendees', [])
+                ],
+                'invite_sent': True
+            }
+            
+        except Exception as e:
+            print(f"❌ Failed to send interview invite: {e}")
+            return None
+    
+    def delete_event(self, calendar_id: str, event_id: str) -> bool:
+        """Delete a calendar event."""
+        if not self._service:
+            return False
+        
+        try:
+            self._service.events().delete(
+                calendarId=calendar_id,
+                eventId=event_id,
+                sendUpdates='all'
+            ).execute()
+            print(f"✅ Calendar event deleted: {event_id}")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to delete event: {e}")
+            return False
 
 
-# Singleton instance getter
+# Singleton getter
 def get_calendar_service() -> CalendarService:
     """Get the singleton CalendarService instance."""
     return CalendarService()
-
-

@@ -1,0 +1,16 @@
+{
+  "_comment": "Solution Architect Allowlist - Each SA has their own timezone for overlap calculation",
+  
+  "solution_architects": [
+    {
+      "id": "sa1",
+      "name": "Xiaodi Liu (Test)",
+      "email": "taylorkkxiaodiliu@gmail.com",
+      "calendar_id": "taylorkkxiaodiliu@gmail.com",
+      "specialty": "Data Engineering",
+      "timezone": "Europe/Berlin",
+      "active": true,
+      "max_interviews_per_week": 5
+    }
+  ]
+}

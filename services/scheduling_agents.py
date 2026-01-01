@@ -38,10 +38,12 @@ class SchedulingState(TypedDict):
     duration_minutes: int
     preferred_date_start: str
     preferred_date_end: str
+    candidate_timezone: str  # Candidate's timezone - system finds SAs with overlap
     
     # Calendar Agent outputs
     all_sa_ids: List[str]
     available_slots: List[Dict]  # Slots with availability per SA
+    compatible_sa_ids: List[str]  # SAs who have timezone overlap with candidate
     
     # Distribution Agent outputs
     ranked_slots: List[Dict]  # Slots ranked by fairness
@@ -101,6 +103,7 @@ class SchedulingAgentSystem:
     def _calendar_agent_node(self, state: SchedulingState) -> Dict:
         """
         Calendar Agent: Fetches availability from all SA calendars.
+        Automatically finds SAs who have overlapping working hours with the candidate.
         """
         print("📅 Calendar Agent: Checking all SA calendars...")
         
@@ -108,22 +111,61 @@ class SchedulingAgentSystem:
         all_sas = self.tracker.get_all_sas()
         all_sa_ids = [sa['id'] for sa in all_sas]
         
-        # Get available slots (using demo data or real calendar)
-        available_slots = self._get_calendar_availability(
-            sa_ids=all_sa_ids,
+        # Get candidate timezone
+        candidate_timezone = state.get('candidate_timezone', 'America/Los_Angeles')
+        candidate_tz = pytz.timezone(candidate_timezone)
+        
+        # Find SAs with compatible timezones (have overlap with candidate)
+        compatible_sas = []
+        for sa in all_sas:
+            sa_timezone = sa.get('timezone', 'America/Los_Angeles')
+            sa_tz = pytz.timezone(sa_timezone)
+            
+            overlap_start, overlap_end = self._calculate_working_hour_overlap(
+                interviewer_tz=sa_tz,
+                candidate_tz=candidate_tz
+            )
+            
+            if overlap_start < overlap_end:  # Has overlap
+                compatible_sas.append({
+                    **sa,
+                    'overlap_start': overlap_start,
+                    'overlap_end': overlap_end,
+                    'overlap_hours': overlap_end - overlap_start
+                })
+                print(f"  ✅ {sa['name']} ({sa_timezone}): overlap {overlap_start}:00-{overlap_end}:00")
+            else:
+                print(f"  ❌ {sa['name']} ({sa_timezone}): no overlap with {candidate_timezone}")
+        
+        if not compatible_sas:
+            print(f"⚠️ No SAs have overlapping work hours with candidate timezone {candidate_timezone}")
+            return {
+                "all_sa_ids": all_sa_ids,
+                "compatible_sa_ids": [],
+                "available_slots": []
+            }
+        
+        compatible_sa_ids = [sa['id'] for sa in compatible_sas]
+        
+        # Get available slots for compatible SAs only
+        available_slots = self._get_calendar_availability_per_sa(
+            compatible_sas=compatible_sas,
             start_date=state['preferred_date_start'],
             end_date=state['preferred_date_end'],
-            duration_minutes=state['duration_minutes']
+            duration_minutes=state['duration_minutes'],
+            candidate_timezone=candidate_timezone
         )
         
         return {
             "all_sa_ids": all_sa_ids,
+            "compatible_sa_ids": compatible_sa_ids,
             "available_slots": available_slots
         }
     
     def _distribution_agent_node(self, state: SchedulingState) -> Dict:
         """
         Distribution Agent: Ranks slots and SAs by fairness.
+        Enforces capacity limits - SAs at max weekly interviews are excluded.
         """
         print("⚖️ Distribution Agent: Analyzing workload distribution...")
         
@@ -141,8 +183,22 @@ class SchedulingAgentSystem:
         # Get workload stats
         workload_stats = self.tracker.get_workload_stats(since_days=21)
         
+        # Check for capacity warnings
+        all_sas = self.tracker.get_all_sas()
+        if len(all_sas) == 1:
+            print("  ⚠️ Warning: Only 1 SA configured - no load balancing possible")
+        
+        sas_at_capacity = [
+            s['sa_name'] for s in workload_stats.values() 
+            if s.get('at_capacity', False)
+        ]
+        if sas_at_capacity:
+            print(f"  ⚠️ SAs at weekly capacity: {', '.join(sas_at_capacity)}")
+        
         # Rank each slot
         ranked_slots = []
+        all_at_capacity = False
+        
         for slot in available_slots:
             # Get SAs available for this slot
             available_sa_ids = [
@@ -153,13 +209,18 @@ class SchedulingAgentSystem:
             if not available_sa_ids:
                 continue
             
-            # Rank SAs for this slot
+            # Rank SAs for this slot (excludes those at capacity)
             ranked_sas = self.tracker.rank_sas_for_assignment(
                 available_sa_ids, 
                 interview_type
             )
             
             if not ranked_sas:
+                continue
+            
+            # Check if all SAs are at capacity
+            if ranked_sas[0].get('_all_at_capacity'):
+                all_at_capacity = True
                 continue
             
             best_sa = ranked_sas[0]
@@ -186,18 +247,32 @@ class SchedulingAgentSystem:
             reasoning = self._generate_reasoning(recommended, workload_stats)
         else:
             recommended = None
-            reasoning = "No suitable slot/SA combination found."
+            if all_at_capacity:
+                # Build helpful message about capacity
+                capacity_details = [
+                    f"{s['sa_name']}: {s['weekly_count']}/{s['max_per_week']} this week"
+                    for s in workload_stats.values()
+                ]
+                reasoning = f"All SAs are at weekly capacity. {'; '.join(capacity_details)}. Try next week or add more SAs."
+            elif len(all_sas) == 0:
+                reasoning = "No SAs configured. Please add Solution Architects to sa_config.json."
+            elif len(all_sas) == 1:
+                reasoning = "Only 1 SA configured and they have no available slots. Add more SAs for better coverage."
+            else:
+                reasoning = "No suitable slot/SA combination found in the date range."
         
         return {
             "ranked_slots": ranked_slots,
             "recommended_slot": recommended,
             "recommended_sa": recommended['best_sa_id'] if recommended else None,
-            "reasoning": reasoning
+            "reasoning": reasoning,
+            "all_at_capacity": all_at_capacity
         }
     
     def _scheduling_agent_node(self, state: SchedulingState) -> Dict:
         """
         Scheduling Agent: Finalizes the assignment and creates the booking.
+        Also creates the actual calendar event with Google Meet link.
         """
         print("✅ Scheduling Agent: Finalizing assignment...")
         
@@ -211,6 +286,8 @@ class SchedulingAgentSystem:
                 "error": "No suitable slot or SA available"
             }
         
+        sa_info = self.tracker.get_sa(recommended_sa)
+        
         # Create the interview record
         interview = self.tracker.add_interview(
             candidate_name=state['candidate_name'],
@@ -222,7 +299,64 @@ class SchedulingAgentSystem:
             notes=f"Auto-scheduled. {state.get('reasoning', '')}"
         )
         
-        sa_info = self.tracker.get_sa(recommended_sa)
+        # Send calendar invites via email with RSVP
+        calendar_event = None
+        meet_link = None
+        try:
+            from services.calendar_service import get_calendar_service
+            cal_service = get_calendar_service()
+            
+            if cal_service.is_authenticated():
+                print("📧 Invite Agent: Sending calendar invites with RSVP...")
+                
+                # Get interview type display name
+                interview_types = {
+                    'tech_screen': 'Technical Screen',
+                    'system_design': 'System Design',
+                    'coding': 'Coding Interview',
+                    'ml_ai': 'ML/AI Deep Dive',
+                    'data': 'Data Engineering',
+                    'architecture': 'Architecture Review',
+                }
+                type_display = interview_types.get(state['interview_type'], state['interview_type'])
+                
+                # Create event title and description
+                title = f"Interview: {state['candidate_name']} - {type_display}"
+                description = f"""Technical Interview
+
+Candidate: {state['candidate_name']}
+Email: {state['candidate_email']}
+Type: {type_display}
+Duration: {state['duration_minutes']} minutes
+
+Interviewer: {sa_info['name'] if sa_info else 'TBD'}
+
+Please accept this invite to confirm your attendance.
+
+---
+Scheduled by TA Interview Scheduler
+{state.get('reasoning', '')}
+"""
+                
+                # Build attendee list
+                attendees = [state['candidate_email']]
+                if sa_info and sa_info.get('email'):
+                    attendees.append(sa_info['email'])
+                
+                # Send invites - creates event on organizer's calendar
+                # and sends email invites to all attendees
+                calendar_event = cal_service.send_interview_invite(
+                    title=title,
+                    start_time=recommended_slot['start'],
+                    end_time=recommended_slot['end'],
+                    description=description,
+                    attendees=attendees
+                )
+                
+                if calendar_event:
+                    meet_link = calendar_event.get('meet_link', '')
+        except Exception as e:
+            print(f"⚠️ Calendar invite failed (interview still recorded locally): {e}")
         
         final_assignment = {
             "interview_id": interview['id'],
@@ -237,7 +371,9 @@ class SchedulingAgentSystem:
             "assigned_sa_id": recommended_sa,
             "assigned_sa_name": sa_info['name'] if sa_info else 'Unknown',
             "assigned_sa_email": sa_info['email'] if sa_info else '',
-            "reasoning": state.get('reasoning', '')
+            "reasoning": state.get('reasoning', ''),
+            "calendar_event": calendar_event,
+            "meet_link": meet_link,
         }
         
         return {
@@ -253,11 +389,21 @@ class SchedulingAgentSystem:
         sa_ids: List[str],
         start_date: str,
         end_date: str,
-        duration_minutes: int
+        duration_minutes: int,
+        interviewer_timezone: str = 'America/Los_Angeles',
+        candidate_timezone: str = 'America/Los_Angeles'
     ) -> List[Dict]:
         """
         Get calendar availability for all SAs.
-        Currently uses simulated data; will connect to real Google Calendar.
+        Finds slots that are within working hours for BOTH the interviewer AND candidate.
+        
+        Args:
+            sa_ids: List of SA IDs to check
+            start_date: Start date for search
+            end_date: End date for search
+            duration_minutes: Interview duration
+            interviewer_timezone: Interviewer's timezone
+            candidate_timezone: Candidate's timezone for overlap calculation
         """
         from dateutil import parser as date_parser
         
@@ -272,7 +418,27 @@ class SchedulingAgentSystem:
         else:
             end = end_date
         
-        tz = pytz.timezone('America/Los_Angeles')
+        # Use the provided interviewer timezone
+        sa_timezone = interviewer_timezone
+        
+        sa_tz = pytz.timezone(sa_timezone)
+        candidate_tz = pytz.timezone(candidate_timezone)
+        
+        # Calculate overlapping working hours (9 AM - 5 PM for both parties)
+        overlap_start, overlap_end = self._calculate_working_hour_overlap(
+            interviewer_tz=sa_tz,
+            candidate_tz=candidate_tz,
+            work_start=9,
+            work_end=17
+        )
+        
+        print(f"🕐 Timezone overlap: {overlap_start}:00 - {overlap_end}:00 (in interviewer's {sa_timezone})")
+        print(f"   Candidate TZ: {candidate_timezone}")
+        
+        if overlap_start >= overlap_end:
+            print("⚠️ No overlapping working hours between timezones!")
+            return []
+        
         slots = []
         current = start
         
@@ -290,22 +456,32 @@ class SchedulingAgentSystem:
                 
                 calendar_ids = list(sa_calendar_map.values())
                 
-                start_dt = tz.localize(datetime.combine(start, datetime.min.time().replace(hour=9)))
-                end_dt = tz.localize(datetime.combine(end, datetime.min.time().replace(hour=17)))
+                start_dt = sa_tz.localize(datetime.combine(start, datetime.min.time().replace(hour=overlap_start)))
+                end_dt = sa_tz.localize(datetime.combine(end, datetime.min.time().replace(hour=overlap_end)))
                 
+                print(f"📅 Using real calendar data for: {calendar_ids}")
                 real_slots = cal_service.find_available_slots(
-                    calendar_ids=calendar_ids,
+                    calendar_emails=calendar_ids,
                     start_date=start_dt,
                     end_date=end_dt,
-                    slot_duration_minutes=duration_minutes
+                    slot_duration_minutes=duration_minutes,
+                    work_start_hour=overlap_start,
+                    work_end_hour=overlap_end,
+                    timezone=sa_timezone
                 )
                 
-                # Map calendar IDs back to SA IDs
+                # Map calendar IDs back to SA IDs and add candidate time display
                 for slot in real_slots:
                     sa_availability = {}
                     for sa_id, cal_id in sa_calendar_map.items():
                         sa_availability[sa_id] = slot['availability'].get(cal_id, False)
                     slot['availability'] = sa_availability
+                    
+                    # Add candidate's local time for display
+                    slot_start = date_parser.parse(slot['start'])
+                    candidate_local = slot_start.astimezone(candidate_tz)
+                    slot['candidate_time'] = candidate_local.strftime('%I:%M %p')
+                    slot['candidate_timezone'] = candidate_timezone
                 
                 return real_slots
         except Exception as e:
@@ -332,9 +508,9 @@ class SchedulingAgentSystem:
         # Use seeded random for consistency but different per day
         while current <= end:
             if current.weekday() < 5:  # Skip weekends
-                for hour in range(9, 17):
-                    if hour + (duration_minutes / 60) <= 17:
-                        slot_start = tz.localize(
+                for hour in range(overlap_start, overlap_end):
+                    if hour + (duration_minutes / 60) <= overlap_end:
+                        slot_start = sa_tz.localize(
                             datetime.combine(current, datetime.min.time().replace(hour=hour))
                         )
                         slot_end = slot_start + timedelta(minutes=duration_minutes)
@@ -368,11 +544,16 @@ class SchedulingAgentSystem:
                         
                         # Only include if at least one SA available
                         if any(availability.values()):
+                            # Add candidate's local time for display
+                            candidate_local = slot_start.astimezone(candidate_tz)
+                            
                             slots.append({
                                 'start': slot_start.isoformat(),
                                 'end': slot_end.isoformat(),
                                 'date': current.strftime('%Y-%m-%d'),
                                 'time': slot_start.strftime('%I:%M %p'),
+                                'candidate_time': candidate_local.strftime('%I:%M %p'),
+                                'candidate_timezone': candidate_timezone,
                                 'availability': availability
                             })
             
@@ -381,6 +562,257 @@ class SchedulingAgentSystem:
         # Reset random seed
         random.seed()
         return slots
+    
+    def _get_calendar_availability_per_sa(
+        self,
+        compatible_sas: List[Dict],
+        start_date: str,
+        end_date: str,
+        duration_minutes: int,
+        candidate_timezone: str
+    ) -> List[Dict]:
+        """
+        Get calendar availability checking each SA's timezone individually.
+        Only returns slots within each SA's overlap window with the candidate.
+        """
+        from dateutil import parser as date_parser
+        
+        # Parse dates
+        if isinstance(start_date, str):
+            start = date_parser.parse(start_date).date()
+        else:
+            start = start_date
+        
+        if isinstance(end_date, str):
+            end = date_parser.parse(end_date).date()
+        else:
+            end = end_date
+        
+        candidate_tz = pytz.timezone(candidate_timezone)
+        
+        # Get scheduled interviews for conflict checking
+        scheduled_interviews = self.tracker.get_upcoming_interviews()
+        sa_busy_times = {}
+        for interview in scheduled_interviews:
+            sa_id = interview.get('assigned_sa_id')
+            if sa_id not in sa_busy_times:
+                sa_busy_times[sa_id] = []
+            try:
+                interview_start = date_parser.parse(interview['scheduled_time'])
+                interview_duration = interview.get('duration_minutes', 60)
+                interview_end = interview_start + timedelta(minutes=interview_duration)
+                sa_busy_times[sa_id].append((interview_start, interview_end))
+            except Exception as e:
+                print(f"Error parsing interview time: {e}")
+        
+        # Try real calendar service first
+        try:
+            from services.calendar_service import get_calendar_service
+            cal_service = get_calendar_service()
+            
+            if cal_service.is_authenticated():
+                return self._get_real_calendar_slots_per_sa(
+                    compatible_sas, start, end, duration_minutes, 
+                    candidate_tz, cal_service, sa_busy_times
+                )
+        except Exception as e:
+            print(f"Calendar service error, using simulated data: {e}")
+        
+        # Fall back to simulated availability
+        all_slots = {}  # slot_key -> {slot_data, availability: {sa_id: bool}}
+        
+        for sa in compatible_sas:
+            sa_id = sa['id']
+            sa_tz = pytz.timezone(sa.get('timezone', 'America/Los_Angeles'))
+            overlap_start = sa['overlap_start']
+            overlap_end = sa['overlap_end']
+            
+            current = start
+            while current <= end:
+                if current.weekday() < 5:  # Skip weekends
+                    for hour in range(overlap_start, overlap_end):
+                        if hour + (duration_minutes / 60) <= overlap_end:
+                            slot_start = sa_tz.localize(
+                                datetime.combine(current, datetime.min.time().replace(hour=hour))
+                            )
+                            slot_end = slot_start + timedelta(minutes=duration_minutes)
+                            
+                            # Check if SA is booked at this time
+                            is_booked = False
+                            for busy_start, busy_end in sa_busy_times.get(sa_id, []):
+                                if not (slot_end <= busy_start or slot_start >= busy_end):
+                                    is_booked = True
+                                    break
+                            
+                            # Create slot key (use UTC for consistency)
+                            slot_utc = slot_start.astimezone(pytz.UTC)
+                            slot_key = slot_utc.isoformat()
+                            
+                            if slot_key not in all_slots:
+                                candidate_local = slot_start.astimezone(candidate_tz)
+                                all_slots[slot_key] = {
+                                    'start': slot_start.isoformat(),
+                                    'end': slot_end.isoformat(),
+                                    'start_utc': slot_key,
+                                    'date': current.strftime('%Y-%m-%d'),
+                                    'time': slot_start.strftime('%I:%M %p'),
+                                    'candidate_time': candidate_local.strftime('%I:%M %p'),
+                                    'candidate_timezone': candidate_timezone,
+                                    'availability': {}
+                                }
+                            
+                            # Simulate availability (80% base, reduced if overloaded)
+                            if is_booked:
+                                all_slots[slot_key]['availability'][sa_id] = False
+                            else:
+                                workload = self.tracker.get_interview_counts(since_days=21)
+                                count = workload.get(sa_id, 0)
+                                base_prob = 0.8 - (count * 0.02)
+                                base_prob = max(0.5, min(0.95, base_prob))
+                                
+                                seed = hash(f"{current}_{hour}_{sa_id}") % 1000
+                                random.seed(seed)
+                                all_slots[slot_key]['availability'][sa_id] = random.random() < base_prob
+                
+                current += timedelta(days=1)
+        
+        random.seed()
+        
+        # Filter to only slots where at least one SA is available
+        slots = [s for s in all_slots.values() if any(s['availability'].values())]
+        slots.sort(key=lambda x: x['start_utc'])
+        
+        return slots
+    
+    def _get_real_calendar_slots_per_sa(
+        self,
+        compatible_sas: List[Dict],
+        start: datetime,
+        end: datetime,
+        duration_minutes: int,
+        candidate_tz: pytz.timezone,
+        cal_service,
+        sa_busy_times: Dict[str, List] = None
+    ) -> List[Dict]:
+        """
+        Get real calendar slots for each SA based on their timezone overlap.
+        Also checks for conflicts with locally scheduled interviews.
+        """
+        from dateutil import parser as date_parser
+        
+        if sa_busy_times is None:
+            sa_busy_times = {}
+        
+        all_slots = {}
+        
+        for sa in compatible_sas:
+            sa_id = sa['id']
+            sa_tz = pytz.timezone(sa.get('timezone', 'America/Los_Angeles'))
+            overlap_start = sa['overlap_start']
+            overlap_end = sa['overlap_end']
+            calendar_id = sa.get('calendar_id', sa['email'])
+            
+            # Query this SA's calendar for their overlap window
+            start_dt = sa_tz.localize(datetime.combine(start, datetime.min.time().replace(hour=overlap_start)))
+            end_dt = sa_tz.localize(datetime.combine(end, datetime.min.time().replace(hour=overlap_end)))
+            
+            print(f"📅 Checking {sa['name']}'s calendar ({overlap_start}:00-{overlap_end}:00 {sa.get('timezone')})")
+            
+            try:
+                real_slots = cal_service.find_available_slots(
+                    calendar_emails=[calendar_id],
+                    start_date=start_dt,
+                    end_date=end_dt,
+                    slot_duration_minutes=duration_minutes,
+                    work_start_hour=overlap_start,
+                    work_end_hour=overlap_end,
+                    timezone=sa.get('timezone', 'America/Los_Angeles')
+                )
+                
+                for slot in real_slots:
+                    slot_start = date_parser.parse(slot['start'])
+                    slot_end = date_parser.parse(slot['end'])
+                    slot_utc = slot_start.astimezone(pytz.UTC)
+                    slot_key = slot_utc.isoformat()
+                    
+                    if slot_key not in all_slots:
+                        candidate_local = slot_start.astimezone(candidate_tz)
+                        all_slots[slot_key] = {
+                            'start': slot['start'],
+                            'end': slot['end'],
+                            'start_utc': slot_key,
+                            'date': slot['date'],
+                            'time': slot['time'],
+                            'candidate_time': candidate_local.strftime('%I:%M %p'),
+                            'candidate_timezone': str(candidate_tz),
+                            'availability': {}
+                        }
+                    
+                    # Check Google Calendar availability
+                    is_available = slot['availability'].get(calendar_id, False)
+                    
+                    # Also check for conflicts with locally scheduled interviews
+                    if is_available and sa_id in sa_busy_times:
+                        for busy_start, busy_end in sa_busy_times[sa_id]:
+                            # Check for overlap
+                            if not (slot_end <= busy_start or slot_start >= busy_end):
+                                is_available = False
+                                print(f"  ⚠️ {sa['name']} has existing interview at {slot['time']}")
+                                break
+                    all_slots[slot_key]['availability'][sa_id] = is_available
+                    
+            except Exception as e:
+                print(f"  Error checking {sa['name']}'s calendar: {e}")
+        
+        # Filter to only slots where at least one SA is available
+        slots = [s for s in all_slots.values() if any(s['availability'].values())]
+        slots.sort(key=lambda x: x['start_utc'])
+        
+        return slots
+    
+    def _calculate_working_hour_overlap(
+        self,
+        interviewer_tz: pytz.timezone,
+        candidate_tz: pytz.timezone,
+        work_start: int = 9,
+        work_end: int = 17
+    ) -> tuple:
+        """
+        Calculate the overlapping working hours between two timezones.
+        
+        Args:
+            interviewer_tz: Interviewer's timezone
+            candidate_tz: Candidate's timezone
+            work_start: Start of work day (hour, e.g., 9 for 9 AM)
+            work_end: End of work day (hour, e.g., 17 for 5 PM)
+            
+        Returns:
+            Tuple of (overlap_start, overlap_end) in interviewer's timezone
+        """
+        # Use a reference date
+        ref_date = datetime(2025, 1, 6)  # A Monday
+        
+        # Interviewer's working hours in their timezone
+        interviewer_work_start = interviewer_tz.localize(
+            datetime.combine(ref_date, datetime.min.time().replace(hour=work_start))
+        )
+        interviewer_work_end = interviewer_tz.localize(
+            datetime.combine(ref_date, datetime.min.time().replace(hour=work_end))
+        )
+        
+        # Candidate's working hours in their timezone, converted to interviewer's TZ
+        candidate_work_start = candidate_tz.localize(
+            datetime.combine(ref_date, datetime.min.time().replace(hour=work_start))
+        ).astimezone(interviewer_tz)
+        candidate_work_end = candidate_tz.localize(
+            datetime.combine(ref_date, datetime.min.time().replace(hour=work_end))
+        ).astimezone(interviewer_tz)
+        
+        # Find overlap
+        overlap_start = max(interviewer_work_start.hour, candidate_work_start.hour)
+        overlap_end = min(interviewer_work_end.hour, candidate_work_end.hour)
+        
+        return (overlap_start, overlap_end)
     
     def _generate_reasoning(self, slot: Dict, workload_stats: Dict) -> str:
         """Generate human-readable reasoning for the recommendation."""
@@ -417,10 +849,15 @@ class SchedulingAgentSystem:
         interview_type: str,
         duration_minutes: int = 60,
         preferred_date_start: Optional[str] = None,
-        preferred_date_end: Optional[str] = None
+        preferred_date_end: Optional[str] = None,
+        candidate_timezone: str = 'America/Los_Angeles',
+        **kwargs  # Accept but ignore interviewer_timezone for backwards compatibility
     ) -> Dict:
         """
         Automatically schedule an interview using the multi-agent system.
+        
+        The system automatically finds SAs who have overlapping working hours
+        with the candidate's timezone.
         
         Args:
             candidate_name: Name of the candidate
@@ -429,13 +866,13 @@ class SchedulingAgentSystem:
             duration_minutes: Duration of interview
             preferred_date_start: Start of date range (default: today)
             preferred_date_end: End of date range (default: 7 days from now)
+            candidate_timezone: Candidate's timezone - system finds compatible SAs
             
         Returns:
             Dict with scheduling result including assigned SA and time
         """
-        # Set default dates
-        tz = pytz.timezone('America/Los_Angeles')
-        now = datetime.now(tz)
+        # Set default dates (use UTC for consistency)
+        now = datetime.now(pytz.UTC)
         
         if not preferred_date_start:
             preferred_date_start = now.date().isoformat()
@@ -450,7 +887,9 @@ class SchedulingAgentSystem:
             "duration_minutes": duration_minutes,
             "preferred_date_start": preferred_date_start,
             "preferred_date_end": preferred_date_end,
+            "candidate_timezone": candidate_timezone,
             "all_sa_ids": [],
+            "compatible_sa_ids": [],
             "available_slots": [],
             "ranked_slots": [],
             "recommended_slot": None,
@@ -479,31 +918,59 @@ class SchedulingAgentSystem:
         duration_minutes: int = 60,
         preferred_date_start: Optional[str] = None,
         preferred_date_end: Optional[str] = None,
-        top_n: int = 5
+        candidate_timezone: str = 'America/Los_Angeles',
+        top_n: int = 5,
+        **kwargs  # Accept but ignore interviewer_timezone for backwards compatibility
     ) -> Dict:
         """
         Get a preview of scheduling options without actually booking.
         
         Returns top N recommendations with reasoning.
         """
-        tz = pytz.timezone('America/Los_Angeles')
-        now = datetime.now(tz)
+        now = datetime.now(pytz.UTC)
         
         if not preferred_date_start:
             preferred_date_start = now.date().isoformat()
         if not preferred_date_end:
             preferred_date_end = (now + timedelta(days=7)).date().isoformat()
         
-        # Get all SAs
+        # Get all SAs and find those with timezone overlap
         all_sas = self.tracker.get_all_sas()
-        all_sa_ids = [sa['id'] for sa in all_sas]
+        candidate_tz = pytz.timezone(candidate_timezone)
         
-        # Get availability
-        available_slots = self._get_calendar_availability(
-            sa_ids=all_sa_ids,
+        compatible_sas = []
+        for sa in all_sas:
+            sa_timezone = sa.get('timezone', 'America/Los_Angeles')
+            sa_tz = pytz.timezone(sa_timezone)
+            
+            overlap_start, overlap_end = self._calculate_working_hour_overlap(
+                interviewer_tz=sa_tz,
+                candidate_tz=candidate_tz
+            )
+            
+            if overlap_start < overlap_end:
+                compatible_sas.append({
+                    **sa,
+                    'overlap_start': overlap_start,
+                    'overlap_end': overlap_end,
+                    'overlap_hours': overlap_end - overlap_start
+                })
+        
+        if not compatible_sas:
+            return {
+                "total_slots_found": 0,
+                "recommendations": [],
+                "workload_stats": {},
+                "error": f"No SAs have overlapping work hours with candidate timezone {candidate_timezone}"
+            }
+        
+        # Get availability for compatible SAs
+        available_slots = self._get_calendar_availability_per_sa(
+            compatible_sas=compatible_sas,
             start_date=preferred_date_start,
             end_date=preferred_date_end,
-            duration_minutes=duration_minutes
+            duration_minutes=duration_minutes,
+            candidate_timezone=candidate_timezone
         )
         
         # Rank slots

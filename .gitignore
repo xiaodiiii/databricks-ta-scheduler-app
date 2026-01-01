@@ -17,6 +17,7 @@ build/
 # Credentials - NEVER commit these
 credentials.json
 service_account.json
+service_account.json.backup
 token.pickle
 *.pem
 *.key

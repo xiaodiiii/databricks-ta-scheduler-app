@@ -65,6 +65,21 @@ INTERVIEW_TYPES = [
     {"label": "Architecture Review", "value": "architecture"},
 ]
 
+# Common timezones for selection
+TIMEZONES = [
+    {"label": "Pacific (PT) - Los Angeles", "value": "America/Los_Angeles"},
+    {"label": "Mountain (MT) - Denver", "value": "America/Denver"},
+    {"label": "Central (CT) - Chicago", "value": "America/Chicago"},
+    {"label": "Eastern (ET) - New York", "value": "America/New_York"},
+    {"label": "UTC", "value": "UTC"},
+    {"label": "Central European (CET)", "value": "Europe/Berlin"},
+    {"label": "UK (GMT/BST)", "value": "Europe/London"},
+    {"label": "India (IST)", "value": "Asia/Kolkata"},
+    {"label": "China (CST)", "value": "Asia/Shanghai"},
+    {"label": "Japan (JST)", "value": "Asia/Tokyo"},
+    {"label": "Australia Eastern", "value": "Australia/Sydney"},
+]
+
 
 def create_header():
     """Create the app header with Databricks styling."""
@@ -119,35 +134,30 @@ def create_scheduling_form():
     """Create the interview scheduling form."""
     return dmc.Paper(
         shadow="sm",
-        p="lg",
+        p="md",
         radius="md",
         withBorder=True,
-        style={"backgroundColor": COLORS["white"], "height": "480px", "overflow": "hidden"},
+        style={"backgroundColor": COLORS["white"], "height": "520px", "overflow": "hidden"},
         children=[
             dmc.Stack(
-                gap="sm",
+                gap="xs",
                 children=[
                     dmc.Title("Schedule Interview", order=4),
-                    dmc.Text(
-                        "Enter candidate details. The system will find the best interviewer.",
-                        size="xs",
-                        c="dimmed",
-                    ),
                     
                     dmc.Divider(),
                     
                     # Candidate Information
                     dmc.Grid(
-                        gutter="sm",
+                        gutter="xs",
                         children=[
                             dmc.GridCol(
                                 dmc.TextInput(
                                     id="candidate-name",
-                                    label="Candidate Name",
+                                    label="Candidate",
                                     placeholder="Full name",
                                     leftSection=get_icon("material-symbols:person-outline"),
                                     required=True,
-                                    size="sm",
+                                    size="xs",
                                 ),
                                 span=6,
                             ),
@@ -158,7 +168,7 @@ def create_scheduling_form():
                                     placeholder="email@company.com",
                                     leftSection=get_icon("material-symbols:mail-outline"),
                                     required=True,
-                                    size="sm",
+                                    size="xs",
                                 ),
                                 span=6,
                             ),
@@ -166,17 +176,17 @@ def create_scheduling_form():
                     ),
                     
                     dmc.Grid(
-                        gutter="sm",
+                        gutter="xs",
                         children=[
                             dmc.GridCol(
                                 dmc.Select(
                                     id="interview-type",
-                                    label="Interview Type",
-                                    placeholder="Select type",
+                                    label="Type",
+                                    placeholder="Select",
                                     data=INTERVIEW_TYPES,
                                     leftSection=get_icon("material-symbols:assignment-outline"),
                                     required=True,
-                                    size="sm",
+                                    size="xs",
                                 ),
                                 span=6,
                             ),
@@ -192,7 +202,7 @@ def create_scheduling_form():
                                         {"label": "90 min", "value": "90"},
                                     ],
                                     leftSection=get_icon("material-symbols:schedule-outline"),
-                                    size="sm",
+                                    size="xs",
                                 ),
                                 span=6,
                             ),
@@ -200,40 +210,56 @@ def create_scheduling_form():
                     ),
                     
                     dmc.Grid(
-                        gutter="sm",
+                        gutter="xs",
                         children=[
                             dmc.GridCol(
                                 dmc.DateInput(
                                     id="start-date",
-                                    label="From Date",
+                                    label="From",
                                     value=datetime.now().date(),
                                     minDate=datetime.now().date(),
                                     leftSection=get_icon("material-symbols:calendar-today"),
-                                    size="sm",
+                                    size="xs",
                                 ),
                                 span=6,
                             ),
                             dmc.GridCol(
                                 dmc.DateInput(
                                     id="end-date",
-                                    label="To Date",
+                                    label="To",
                                     value=(datetime.now() + timedelta(days=7)).date(),
                                     minDate=datetime.now().date(),
                                     leftSection=get_icon("material-symbols:event"),
-                                    size="sm",
+                                    size="xs",
                                 ),
                                 span=6,
                             ),
                         ],
                     ),
                     
-                    dmc.Space(h="sm"),
+                    # Candidate timezone
+                    dmc.Select(
+                        id="candidate-timezone",
+                        label="Candidate's Timezone",
+                        description="System finds SAs with overlapping work hours",
+                        data=TIMEZONES,
+                        value="America/Los_Angeles",
+                        leftSection=get_icon("material-symbols:globe"),
+                        searchable=True,
+                        size="xs",
+                    ),
+                    
+                    # Hidden dummy for interviewer-timezone (for callback compatibility)
+                    html.Div(id="interviewer-timezone", style={"display": "none"}),
+                    
+                    dmc.Space(h="xs"),
                     
                     dmc.Button(
                         "Find Best Slot",
                         id="auto-schedule-btn",
                         leftSection=get_icon("material-symbols:auto-awesome"),
                         fullWidth=True,
+                        size="sm",
                     ),
                     dmc.Button(
                         "Preview All Options",
@@ -241,7 +267,7 @@ def create_scheduling_form():
                         variant="subtle",
                         leftSection=get_icon("material-symbols:visibility"),
                         fullWidth=True,
-                        size="sm",
+                        size="xs",
                     ),
                 ],
             ),
@@ -286,13 +312,13 @@ def create_right_panel():
     return dmc.Stack(
         gap="lg",
         children=[
-            # Result Panel - matches Schedule Form height (480px)
+            # Result Panel - matches Schedule Form height (520px)
             dmc.Paper(
                 shadow="sm",
                 p="lg",
                 radius="md",
                 withBorder=True,
-                style={"backgroundColor": COLORS["white"], "height": "480px"},
+                style={"backgroundColor": COLORS["white"], "height": "520px"},
                 children=[
                     dmc.Stack(
                         gap="md",
@@ -319,7 +345,7 @@ def create_right_panel():
                                         loaderProps={"type": "dots"},
                                     ),
                                     dmc.ScrollArea(
-                                        h=380,
+                                        h=420,
                                         type="auto",
                                         offsetScrollbars=True,
                                         children=html.Div(
@@ -453,22 +479,39 @@ def initialize_app(_):
         tracker = get_interview_tracker()
         
         stats = tracker.get_workload_stats(since_days=21)
+        all_sas = tracker.get_all_sas()
         
-        # Create workload bars
+        # Create workload items
         workload_items = []
-        max_count = max((s['interview_count'] for s in stats.values()), default=1) or 1
+        
+        # Warning if only 1 SA
+        if len(all_sas) == 1:
+            workload_items.append(
+                dmc.Alert(
+                    "Only 1 SA configured. Add more for load balancing.",
+                    color="yellow",
+                    icon=get_icon("material-symbols:warning"),
+                    mb="sm",
+                )
+            )
         
         for sa_id, sa_stats in stats.items():
-            count = sa_stats['interview_count']
-            pct = (count / max_count) * 100 if max_count > 0 else 0
+            weekly_count = sa_stats.get('weekly_count', 0)
+            max_per_week = sa_stats.get('max_per_week', 5)
+            at_capacity = sa_stats.get('at_capacity', False)
             
-            # Determine status color
-            if sa_stats['deviation'] < -0.5:
-                color = "green"
-            elif sa_stats['deviation'] > 0.5:
+            # Capacity percentage (0-100)
+            capacity_pct = min((weekly_count / max_per_week) * 100, 100) if max_per_week > 0 else 0
+            
+            # Color based on capacity
+            if at_capacity:
+                color = "red"
+            elif capacity_pct >= 80:
                 color = "orange"
+            elif capacity_pct >= 50:
+                color = "yellow"
             else:
-                color = "blue"
+                color = "green"
             
             workload_items.append(
                 dmc.Stack(
@@ -478,24 +521,50 @@ def initialize_app(_):
                         dmc.Group(
                             justify="space-between",
                             children=[
-                                dmc.Text(sa_stats['sa_name'], size="sm"),
-                                dmc.Text(f"{count}", size="sm", c="dimmed"),
+                                dmc.Group(
+                                    gap="xs",
+                                    children=[
+                                        dmc.Text(sa_stats['sa_name'], size="sm", fw=500),
+                                        dmc.Badge(
+                                            "At Capacity",
+                                            color="red",
+                                            size="xs",
+                                            variant="filled",
+                                        ) if at_capacity else None,
+                                    ],
+                                ),
+                                dmc.Text(
+                                    f"{weekly_count}/{max_per_week} this week",
+                                    size="xs",
+                                    c="dimmed",
+                                ),
                             ],
                         ),
                         dmc.Progress(
-                            value=pct,
+                            value=capacity_pct,
                             color=color,
                             size="sm",
                             radius="xl",
+                        ),
+                        dmc.Text(
+                            f"{sa_stats['interview_count']} interviews (last 3 weeks)",
+                            size="xs",
+                            c="dimmed",
                         ),
                     ],
                 )
             )
         
+        # Filter out None children
+        for item in workload_items:
+            if hasattr(item, 'children') and isinstance(item.children, list):
+                if item.children and hasattr(item.children[0], 'children'):
+                    item.children[0].children = [c for c in item.children[0].children if c is not None]
+        
         return (
             "Ready",
             get_icon("material-symbols:check-circle-outline"),
-            dmc.Stack(gap="xs", children=workload_items) if workload_items else dmc.Text("No data", c="dimmed", size="sm"),
+            dmc.Stack(gap="xs", children=workload_items) if workload_items else dmc.Text("No SAs configured", c="dimmed", size="sm"),
         )
         
     except Exception as e:
@@ -523,11 +592,13 @@ def initialize_app(_):
         State("interview-duration", "value"),
         State("start-date", "value"),
         State("end-date", "value"),
+        State("interviewer-timezone", "value"),
+        State("candidate-timezone", "value"),
     ],
     prevent_initial_call=True,
 )
 def auto_schedule(n_clicks, candidate_name, candidate_email, interview_type, 
-                  duration, start_date, end_date):
+                  duration, start_date, end_date, interviewer_timezone, candidate_timezone):
     """Run the multi-agent scheduling system."""
     if not n_clicks:
         return no_update, no_update, no_update, False, None
@@ -558,6 +629,8 @@ def auto_schedule(n_clicks, candidate_name, candidate_email, interview_type,
             duration_minutes=int(duration or 60),
             preferred_date_start=str(start_date) if start_date else None,
             preferred_date_end=str(end_date) if end_date else None,
+            interviewer_timezone=interviewer_timezone or "America/Los_Angeles",
+            candidate_timezone=candidate_timezone or "America/Los_Angeles",
         )
         
         if result['status'] == 'success' and result.get('final_assignment'):
@@ -639,6 +712,36 @@ def auto_schedule(n_clicks, candidate_name, candidate_email, interview_type,
                                     
                                     dmc.Divider(),
                                     
+                                    # Calendar invite status
+                                    dmc.Stack(
+                                        gap=4,
+                                        children=[
+                                            dmc.Text("Calendar Invite", size="xs", c="dimmed"),
+                                            dmc.Group(
+                                                gap="sm",
+                                                children=[
+                                                    dmc.Badge(
+                                                        "Invites Sent",
+                                                        color="green",
+                                                        variant="light",
+                                                        leftSection=get_icon("material-symbols:mail"),
+                                                    ) if a.get('calendar_event', {}).get('invite_sent') else dmc.Badge(
+                                                        "Local Only",
+                                                        color="gray",
+                                                        variant="light",
+                                                    ),
+                                                    dmc.Anchor(
+                                                        "Join Meet",
+                                                        href=a.get('meet_link', '#'),
+                                                        target="_blank",
+                                                        size="sm",
+                                                        style={"display": "flex", "alignItems": "center", "gap": "4px"},
+                                                    ) if a.get('meet_link') else None,
+                                                ],
+                                            ),
+                                        ],
+                                    ) if a.get('calendar_event') or a.get('meet_link') else None,
+                                    
                                     # Reasoning
                                     dmc.Stack(
                                         gap=4,
@@ -657,6 +760,11 @@ def auto_schedule(n_clicks, candidate_name, candidate_email, interview_type,
                     ),
                 ],
             )
+            
+            # Filter out None children
+            content.children[1].children[0].children = [
+                c for c in content.children[1].children[0].children if c is not None
+            ]
             
             return content, "Scheduled", "green", False, result
         else:
@@ -701,10 +809,13 @@ def auto_schedule(n_clicks, candidate_name, candidate_email, interview_type,
         State("interview-duration", "value"),
         State("start-date", "value"),
         State("end-date", "value"),
+        State("interviewer-timezone", "value"),
+        State("candidate-timezone", "value"),
     ],
     prevent_initial_call=True,
 )
-def preview_options(n_clicks, interview_type, duration, start_date, end_date):
+def preview_options(n_clicks, interview_type, duration, start_date, end_date, 
+                    interviewer_timezone, candidate_timezone):
     """Preview scheduling options without booking."""
     if not n_clicks:
         return no_update, no_update, no_update, False
@@ -730,6 +841,8 @@ def preview_options(n_clicks, interview_type, duration, start_date, end_date):
             duration_minutes=int(duration or 60),
             preferred_date_start=str(start_date) if start_date else None,
             preferred_date_end=str(end_date) if end_date else None,
+            interviewer_timezone=interviewer_timezone or "America/Los_Angeles",
+            candidate_timezone=candidate_timezone or "America/Los_Angeles",
             top_n=5,
         )
         
