@@ -40,7 +40,9 @@ def _load_token_from_databricks_secrets() -> Optional[bytes]:
     token_b64 = os.environ.get('DATABRICKS_OAUTH_TOKEN_B64')
     if token_b64:
         try:
-            return base64.b64decode(token_b64)
+            decoded = base64.b64decode(token_b64)
+            print(f"✅ Loaded token from env var ({len(decoded)} bytes)")
+            return decoded
         except Exception as e:
             print(f"Error decoding token from env: {e}")
     
@@ -49,12 +51,26 @@ def _load_token_from_databricks_secrets() -> Optional[bytes]:
         from databricks.sdk import WorkspaceClient
         w = WorkspaceClient()
         secret = w.secrets.get_secret(scope='ta-scheduler', key='oauth-token')
+        
         if secret and secret.value:
-            return base64.b64decode(secret.value)
+            # The secret value could be string or bytes
+            secret_value = secret.value
+            
+            # If it's bytes, decode to string first
+            if isinstance(secret_value, bytes):
+                secret_value = secret_value.decode('utf-8')
+            
+            # Now decode the base64 string
+            decoded = base64.b64decode(secret_value)
+            print(f"✅ Loaded token from Databricks secrets ({len(decoded)} bytes)")
+            return decoded
+            
     except ImportError:
         pass  # Not running in Databricks
     except Exception as e:
-        print(f"Could not load from Databricks secrets: {e}")
+        print(f"Error loading token from secrets: {e}")
+        import traceback
+        traceback.print_exc()
     
     return None
 
