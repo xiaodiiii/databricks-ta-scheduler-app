@@ -470,10 +470,13 @@ app.layout = dmc.MantineProvider(
         Output("system-status", "leftSection"),
         Output("workload-chart", "children"),
     ],
-    Input("init-interval", "n_intervals"),
+    [
+        Input("init-interval", "n_intervals"),
+        Input("scheduling-result-store", "data"),  # Update after scheduling
+    ],
 )
-def initialize_app(_):
-    """Initialize app and show workload distribution."""
+def initialize_app(_, scheduling_result):
+    """Initialize app and show workload distribution. Also updates after scheduling."""
     try:
         from services.interview_tracker import get_interview_tracker
         tracker = get_interview_tracker()
