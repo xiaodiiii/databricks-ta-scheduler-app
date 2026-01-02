@@ -60,8 +60,24 @@ def _load_token_from_databricks_secrets() -> Optional[bytes]:
             if isinstance(secret_value, bytes):
                 secret_value = secret_value.decode('utf-8')
             
-            # Now decode the base64 string
+            # Decode base64 (Databricks stores as base64)
             decoded = base64.b64decode(secret_value)
+            
+            # Check if it's double-encoded (CLI sometimes does this)
+            # If the decoded data looks like base64, decode again
+            try:
+                if isinstance(decoded, bytes) and len(decoded) > 0:
+                    # Try to decode as base64 again
+                    decoded2 = base64.b64decode(decoded)
+                    # Verify it's valid pickle data
+                    import pickle
+                    pickle.loads(decoded2)
+                    decoded = decoded2
+                    print(f"✅ Loaded token from Databricks secrets (double-decoded, {len(decoded)} bytes)")
+                    return decoded
+            except:
+                pass  # Not double-encoded
+            
             print(f"✅ Loaded token from Databricks secrets ({len(decoded)} bytes)")
             return decoded
             
